@@ -234,7 +234,7 @@ allows the user to toggle between various dashboards.
             // For now, Tensorboard only shows debugger data if the debugger_data GET param is set
             // to enabled.
             let match = window.location.href.match(/[&\?]debugger_data=enabled/);
-            return match && match.length == 1;
+            return !!match && match.length === 1;
           },
         },
         // Which tab is selected (scalars, graph, images etc).

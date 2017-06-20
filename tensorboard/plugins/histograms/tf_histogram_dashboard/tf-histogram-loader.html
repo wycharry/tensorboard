@@ -1,0 +1,266 @@
+<!--
+@license
+Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+<link rel="import" href="../polymer/polymer.html">
+<link rel="import" href="../paper-icon-button/paper-icon-button.html">
+<link rel="import" href="../tf-color-scale/tf-color-scale.html">
+<link rel="import" href="../tf-imports/lodash.html">
+<link rel="import" href="../tf-imports/d3.html">
+<link rel="import" href="../vz-histogram-timeseries/vz-histogram-timeseries.html">
+
+<!--
+  tf-histogram-loader loads an individual histogram from the TensorBoard
+  backend, and renders it into a vz-histogram-timeseries.
+-->
+<dom-module id="tf-histogram-loader">
+  <template>
+    <tf-card-heading title="[[tag]]" color="[[_runColor]]">
+      [[run]]
+    </tf-card-heading>
+    <!--
+      The main histogram that we render. Data is set directly with
+      `setSeriesData`, not with a bound property.
+    -->
+    <vz-histogram-timeseries
+      time-property="[[timeProperty]]"
+      mode="[[histogramMode]]"
+      color-scale="[[_colorScaleFunction]]"
+    ></vz-histogram-timeseries>
+    <div style="display: flex; flex-direction: row;">
+      <paper-icon-button
+        selected$="[[_expanded]]"
+        icon="fullscreen"
+        on-tap="_toggleExpanded"
+      ></paper-icon-button>
+    </div>
+
+    <style>
+      :host {
+        display: flex;
+        flex-direction: column;
+        width: 330px;
+        height: 235px;
+        margin-right: 10px;
+        margin-bottom: 15px;
+      }
+      :host[_expanded] {
+        width: 700px;
+        height: 500px;
+      }
+
+      vz-histogram-timeseries {
+        -moz-user-select: none;
+        -webkit-user-select: none;
+      }
+
+      paper-icon-button {
+        color: #2196F3;
+        border-radius: 100%;
+        pointer-events: auto;  /* TODO(wchargin): why? */
+        width: 32px;
+        height: 32px;
+        padding: 4px;
+      }
+      paper-icon-button[selected] {
+        background: var(--tb-ui-light-accent);
+      }
+    </style>
+  </template>
+  <script>
+    "use strict";
+
+    import {Canceller} from "../tf-backend/canceller";
+    import {getRouter} from "../tf-backend/router";
+    import {runsColorScale} from "../tf-color-scale/colorScale";
+
+    Polymer({
+      is: "tf-histogram-loader",
+      properties: {
+        run: String,
+        tag: String,
+        timeProperty: String,
+        histogramMode: String,
+
+        /** @type {Function} */
+        _colorScaleFunction: {
+          type: Object,  // function: string => string
+          value: () => runsColorScale,
+        },
+        _runColor: {
+          type: String,
+          computed: '_computeRunColor(run)',
+        },
+        _expanded: {
+          type: Boolean,
+          value: false,
+          reflectToAttribute: true,  // for CSS
+        },
+
+        requestManager: Object,
+        _canceller: {
+          type: Object,
+          value: () => new Canceller(),
+        },
+      },
+
+      observers: ['reload(run, tag)'],
+
+      _computeRunColor(run) {
+        return this._colorScaleFunction(run);
+      },
+
+      attached() {
+        this._attached = true;
+        this.reload();
+      },
+      reload() {
+        if (!this._attached) {
+          return;
+        }
+        this._canceller.cancelAll();
+        const router = getRouter();
+        const url = router.pluginRunTagRoute("histograms", "/histograms")(
+          this.tag, this.run);
+        const updateData = this._canceller.cancellable(result => {
+          if (result.cancelled) {
+            return;
+          }
+          const data = result.value;
+          const formattedData = data.map(this._formatDatum.bind(this));
+          const minmin = d3.min(formattedData, d => d.min);
+          const maxmax = d3.max(formattedData, d => d.max);
+          const normalizedData = formattedData.map(h => ({
+            wall_time: h.wall_time,
+            step: h.step,
+            bins: this._convertBins(h, minmin, maxmax, null),
+          }));
+          this.$$('vz-histogram-timeseries').setSeriesData(
+            this.run, normalizedData);
+        });
+        this.requestManager.request(url).then(updateData);
+      },
+      redraw() {
+        this.$$('vz-histogram-timeseries').redraw();
+      },
+
+      /**
+       * Converts a 1-nested array datum (as returned by the TensorBoard
+       * backend) to a flat object datum (as used by `_convertBins`).
+       */
+      _formatDatum(datum) {
+        const [
+          wall_time,
+          step,
+          [min, max, nItems, sum, sumSquares, bucketRightEdges, bucketCounts],
+        ] = datum;
+        return {
+          wall_time, step, min, max, nItems, sum, sumSquares,
+          bucketRightEdges, bucketCounts,
+        };
+      },
+
+      /**
+       * Takes histogram data as returned by `_formatDatum` and converts
+       * it to the standard d3 histogram data format to make it more
+       * compatible and easier to visualize. When rendering histograms,
+       * having access to the left edge and width of each bin makes
+       * things quite a bit easier, so we include these in the result.
+       * We also convert the bins to have a uniform width, which makes
+       * the visualization easier to understand.
+       *
+       * @param histogram A histogram from tensorboard backend.
+       * @param min The leftmost edge. The binning will start on it.
+       * @param max The rightmost edge. The binning will end on it.
+       * @param numBins The number of bins of the converted data. The
+       * default of 30 is sensible: if you use more, you start to get
+       * artifacts because the event data is stored in buckets, and you
+       * start being able to see the aliased borders between each
+       * bucket.
+       *
+       * TODO(wchargin): This function had some nice tests in
+       * `backendTests.ts`, but these were removed because (a) we moved
+       * this code out of `backend.ts` into its present location and
+       * (b) we weren't running TypeScript tests anyway and. Once we get
+       * TypeScript testing working again, reinstate these tests in a
+       * more appropriate location.
+       *
+       * @return A list of histogram bins. Each bin has an `x` (left
+       *     edge), a `dx` (width), and a `y` (count). If the given
+       *     right edges are inclusive, then these left edges (`x`) are
+       *     exclusive.
+       */
+      _convertBins(histogram, min, max, numBins) {
+        if (numBins == null) {
+          numBins = 30;
+        }
+        if (histogram.bucketRightEdges.length
+              !== histogram.bucketCounts.length) {
+          throw new Error("Edges and counts are of different lengths.");
+        }
+
+        if (max === min) {
+          // Create bins even if all the data has a single value.
+          max = min * 1.1 + 1;
+          min = min / 1.1 - 1;
+        }
+        const binWidth = (max - min) / numBins;
+
+        // Use the min as the starting point for the bins.
+        let bucketLeft = min; 
+        let bucketPos = 0;
+        return d3.range(min, max, binWidth).map((binLeft) => {
+          const binRight = binLeft + binWidth;
+
+          // Take the count of each existing bucket, multiply it by the
+          // proportion of overlap with the new bin, then sum and store
+          // as the count for the new bin. If no overlap, will add to
+          // zero; if 100% overlap, will include the full count into new
+          // bin.
+          let binY = 0;
+          while (bucketPos < histogram.bucketRightEdges.length) {
+            // Clip the right edge because right-most edge can be
+            // infinite-sized.
+            const bucketRight = Math.min(
+              max, histogram.bucketRightEdges[bucketPos]);
+
+            const intersect =
+                Math.min(bucketRight, binRight) - Math.max(bucketLeft, binLeft);
+            const count = (intersect / (bucketRight - bucketLeft)) *
+                histogram.bucketCounts[bucketPos];
+
+            binY += intersect > 0 ? count : 0;
+
+            // If bucketRight is bigger than binRight, then this bin is
+            // finished and there is data for the next bin, so don't
+            // increment bucketPos.
+            if (bucketRight > binRight) {
+              break;
+            }
+            bucketLeft = Math.max(min, bucketRight);
+            bucketPos++;
+          }
+          return {x: binLeft, dx: binWidth, y: binY};
+        });
+      },
+
+      _toggleExpanded(e) {
+        this.set('_expanded', !this._expanded);
+        this.redraw();
+      },
+    });
+  </script>
+</dom-module>
